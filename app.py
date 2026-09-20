@@ -29,6 +29,10 @@ st.markdown("""
     .stMetric {
         padding: 10px 8px;
     }
+    /* 讓輸入框在手機上寬一點 */
+    .stTextInput > div > div > input {
+        font-size: 1rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -122,7 +126,6 @@ def momentum_score(df: pd.DataFrame) -> float:
     atr = calculate_atr(df)
     price = float(df["Close"].iloc[-1])
 
-    # 簡化映射（可依歷史資料調整係數）
     bb_score = min(5.0, max(0.0, bb_width * 80))
     atr_score = min(5.0, max(0.0, (atr / price) * 800))
 
@@ -203,19 +206,65 @@ def market_structure_score(df: pd.DataFrame, window: int = 20) -> Tuple[int, str
 
 
 # =========================
-# 主程式：Dashboard（手機版面）
+# 簡化合理價模型（可再改）
+# =========================
+def estimate_fair_value(df: pd.DataFrame, window: int = 60) -> float:
+    """
+    簡化合理價：
+    - 用 60 日均線當基準
+    - 再加減 0.5 * 20 日標準差，當作合理區間中點
+    你可改成：DCF、本益比區間、或你自己的估值模型。
+    """
+    if len(df) < window:
+        df_use = df
+    else:
+        df_use = df.tail(window).copy()
+
+    sma60 = df_use["Close"].rolling(60).mean().iloc[-1]
+    std20 = df_use["Close"].rolling(20).std().iloc[-1]
+
+    fair_value = sma60  # 最簡版：就當合理價 = 60 日均線
+    # 若想加波動調整，可改成：
+    # fair_value = sma60 + 0.0 * std20
+    return float(fair_value)
+
+
+# =========================
+# 主程式：Dashboard（手機優先 + 代號輸入）
 # =========================
 
-# ----- 標題 -----
 st.title("📊 台股決策 Dashboard")
 
-# ----- 側邊欄：股票與參數 -----
-st.sidebar.header("設定")
+# ----- 上方：台股代號/名稱輸入 -----
+st.subheader("🔍 輸入台股代號或名稱")
 
-stock_list = ["2330.TW", "2454.TW", "0050.TW"]
-selected_stock = st.sidebar.selectbox("選擇股票", stock_list)
+stock_input = st.text_input(
+    "台股代號或名稱（例：2330、2330.TW、台積電）",
+    value="2330"
+)
 
-st.sidebar.subheader("分數加權")
+# 這裡先用「假資料」模擬不同股票
+# 之後你可改成：根據 stock_input 去讀 CSV / API / 資料庫
+@st.cache_data
+def load_data_by_stock_name(stock_name: str) -> pd.DataFrame:
+    # 簡化：所有股票都用同一組隨機走勢，只作為示範
+    dates = pd.date_range("2025-01-01", periods=120, freq="D")
+    np.random.seed(hash(stock_name) % 2**32)
+    close = 100 + np.cumsum(np.random.randn(120))
+    df = pd.DataFrame({
+        "Date": dates,
+        "Open": close + np.random.randn(120) * 0.5,
+        "High": close + np.abs(np.random.randn(120)),
+        "Low": close - np.abs(np.random.randn(120)),
+        "Close": close,
+        "Volume": np.random.randint(1000, 10000, 120)
+    })
+    return df
+
+df = load_data_by_stock_name(stock_input)
+
+# ----- 側邊欄：分數加權 -----
+st.sidebar.header("分數加權")
 w_pattern = st.sidebar.slider("形態權重", 0.0, 1.0, 0.30, 0.05)
 w_momentum = st.sidebar.slider("動量權重", 0.0, 1.0, 0.25, 0.05)
 w_pivot = st.sidebar.slider("樞軸權重", 0.0, 1.0, 0.20, 0.05)
@@ -230,24 +279,6 @@ w_pivot /= total_w
 w_structure /= total_w
 
 st.sidebar.info("加權總和已自動正規化為 1.00")
-
-# ----- 載入資料（此處用假資料，之後可改接 CSV / API） -----
-@st.cache_data
-def load_data(stock_id: str) -> pd.DataFrame:
-    dates = pd.date_range("2025-01-01", periods=120, freq="D")
-    np.random.seed(42)
-    close = 100 + np.cumsum(np.random.randn(120))
-    df = pd.DataFrame({
-        "Date": dates,
-        "Open": close + np.random.randn(120) * 0.5,
-        "High": close + np.abs(np.random.randn(120)),
-        "Low": close - np.abs(np.random.randn(120)),
-        "Close": close,
-        "Volume": np.random.randint(1000, 10000, 120)
-    })
-    return df
-
-df = load_data(selected_stock)
 
 # ----- 計算四大模塊分數 -----
 pattern_w_score, w_flag = detect_w_bottom(df)
@@ -277,37 +308,78 @@ total_score_5 = (
 )
 total_score_10 = total_score_5 * 2.0
 
-# =========================
-# 手機版面配置重點
-# =========================
-# 1. 最上方直接放「進場建議」+「總分」
-# 2. 再用一行四格顯示四個模塊分數
-# 3. 圖表高度控制在 350–400px
-# 4. 詳細資料全部收進 expander
+# ----- 合理價 & 收盤價 -----
+fair_value = estimate_fair_value(df)
+current_close = float(df["Close"].iloc[-1])
 
-# ----- 進場建議（手機第一眼看到） -----
-st.subheader("🚦 進場建議")
-
+# ----- 進出場建議邏輯 -----
 threshold_buy = 7.0
-threshold_watch = 5.0
+threshold_sell = 7.0  # 可設成不同，例如 7.5 才考慮減碼
 
-# 用三欄式：左邊總分、中間訊號、右邊空白（避免太擠）
-col_total, col_signal, _ = st.columns([1, 2, 1])
+# 建議進場價：用 S1 / S2 或均線附近
+suggested_entry_long = min(pivot_dict["S1"], pivot_dict["P"])
+suggested_entry_short = max(pivot_dict["R1"], pivot_dict["P"])
 
-with col_total:
-    st.metric("🎯 加權總分", f"{total_score_10:.2f}/10")
+# 停損：用 ATR 或 S2/R2
+atr = calculate_atr(df)
+stop_loss_long = suggested_entry_long - atr * 1.5
+stop_loss_short = suggested_entry_short + atr * 1.5
 
-with col_signal:
-    if total_score_10 >= threshold_buy:
-        st.success(f"✅ 進場訊號：總分 ≥ {threshold_buy}")
-    elif total_score_10 >= threshold_watch:
-        st.warning(f"⚠️ 觀察區間：{threshold_watch}–{threshold_buy}")
-    else:
-        st.info(f"⛔ 暫緩進場：總分 < {threshold_watch}")
+# 建議出場價（獲利目標）：用 R1/R2 或 S1/S2
+target_exit_long = pivot_dict["R2"]
+target_exit_short = pivot_dict["S2"]
 
-st.caption("進場閾值可依個人風險偏好調整。")
+# =========================
+# 手機版面配置
+# =========================
 
-# ----- 評分總覽（四個模塊） -----
+# ----- 1. 合理價 & 收盤價 -----
+st.subheader("💰 合理價 & 收盤價")
+
+col_fair, col_close, _ = st.columns([1, 1, 2])
+
+with col_fair:
+    st.metric("合理價（估算）", f"{fair_value:.2f}")
+
+with col_close:
+    st.metric("最新收盤價", f"{current_close:.2f}")
+
+st.caption("合理價為簡化模型估算，僅供參考，可替換成你自己的估值方法。")
+
+# ----- 2. 何時該進出場（文字建議） -----
+st.subheader("🚦 何時該進出場")
+
+if total_score_10 >= threshold_buy:
+    st.success(f"✅ 目前總分 {total_score_10:.2f} ≥ {threshold_buy}，技術面偏多，可考慮「逢回買進」策略。")
+elif total_score_10 >= 5:
+    st.warning(f"⚠️ 目前總分 {total_score_10:.2f}，介於觀察區間，適合「等待明確訊號」或輕倉試單。")
+else:
+    st.info(f"⛔ 目前總分 {total_score_10:.2f} < 5，技術面偏弱，建議「觀望」或僅短線操作。")
+
+st.caption("進出場閾值可依個人風險偏好調整。")
+
+# ----- 3. 建議進出場價及停損 -----
+st.subheader("🎯 建議進出場價 & 停損")
+
+col_entry, col_target, col_stop = st.columns(3)
+
+with col_entry:
+    st.metric("建議進場價（多）", f"{suggested_entry_long:.2f}")
+    st.metric("建議進場價（空）", f"{suggested_entry_short:.2f}")
+
+with col_target:
+    st.metric("目標出場價（多）", f"{target_exit_long:.2f}")
+    st.metric("目標出場價（空）", f"{target_exit_short:.2f}")
+
+with col_stop:
+    st.metric("停損價（多）", f"{stop_loss_long:.2f}")
+    st.metric("停損價（空）", f"{stop_loss_short:.2f}")
+
+st.caption(
+    "上述價格為根據 Pivot Point 與 ATR 自動計算，實際操作請依個人資金管理與風險承受度調整。"
+)
+
+# ----- 4. 評分總覽（四個模塊） -----
 st.subheader("🧮 評分總覽")
 
 col1, col2, col3, col4 = st.columns(4)
@@ -317,10 +389,9 @@ col2.metric("動量", f"{mom_score:.1f}/10")
 col3.metric("樞軸", f"{piv_score}/5")
 col4.metric("結構", f"{struct_score}/5")
 
-# 市場結構類型用一行小字
 st.caption(f"市場結構：{struct_type}（量價相關性評估）")
 
-# ----- 股價走勢 + 樞軸線（圖表高度控制） -----
+# ----- 5. 股價走勢 + 樞軸線 -----
 st.subheader("📈 股價走勢 & 樞軸線")
 
 fig = go.Figure()
@@ -354,7 +425,7 @@ for key, value in pivot_dict.items():
     )
 
 fig.update_layout(
-    height=380,  # 手機建議 350–400
+    height=380,
     xaxis_rangeslider_visible=False,
     margin=dict(l=10, r=10, t=20, b=10),
     showlegend=False,
@@ -364,12 +435,12 @@ fig.update_layout(
 
 st.plotly_chart(fig, use_container_width=True)
 
-# ----- 詳細資料（全部收合，避免手機太長） -----
+# ----- 6. 詳細資料（收合） -----
 with st.expander("查看詳細資料與樞軸數值"):
     st.dataframe(df.tail(10))
     st.json(pivot_dict)
 
-# ----- 簡易交易日誌（手機也可輸入） -----
+# ----- 7. 簡易交易日誌 -----
 st.subheader("📒 簡易交易日誌")
 
 with st.form("trade_form"):
